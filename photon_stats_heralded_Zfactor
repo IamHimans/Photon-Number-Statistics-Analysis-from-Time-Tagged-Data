@@ -1,0 +1,216 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import poisson
+import math
+from collections import Counter
+import os
+
+# ==================================
+# Global plot styling
+# ==================================
+plt.rcParams.update({
+    "font.size": 14,
+    "font.weight": "bold",
+    "axes.labelweight": "bold",
+    "axes.titleweight": "bold",
+    "axes.linewidth": 2.0,
+    "xtick.major.width": 1.8,
+    "ytick.major.width": 1.8,
+    "legend.frameon": False
+})
+
+# ==================================
+# Helper functions
+# ==================================
+def format_with_uncertainty(value, error):
+    if error == 0 or np.isnan(error):
+        return f"{value:.4f} ± {error:.4f}"
+    exponent = int(np.floor(np.log10(abs(error))))
+    first_digit = int(abs(error) / (10 ** exponent))
+    sig_digits = 1 if first_digit in [1, 2, 3] else 2
+    rounded_error = round(error, -exponent + (sig_digits - 1))
+    decimals = max(0, -int(np.floor(np.log10(rounded_error))))
+    return f"{value:.{decimals}f} ± {rounded_error:.{decimals}f}"
+
+def significance_interpretation(z):
+    az = abs(z)
+    if az < 1:
+        return "not significant"
+    elif az < 2:
+        return "weak"
+    elif az < 3:
+        return "moderate"
+    else:
+        return "significant"
+
+# ==================================
+# User settings
+# ==================================
+input_file = "30s-pump=15mW_heralded_sc=2L-sc=50k_80k-Bpf.txt"
+channel_herald = 3
+channel_A = 1
+channel_B = 2
+
+chunk_size = 200_000        # safe size
+tick_resolution_ps = 81
+coincidence_window_ns = 10
+bin_duration_us = 1000
+
+out_dir = "heralded_chunked_output"
+os.makedirs(out_dir, exist_ok=True)
+
+# ==================================
+# Pre-computed constants
+# ==================================
+tick_per_ns = 1000 / tick_resolution_ps
+window_ticks = int(coincidence_window_ns * tick_per_ns)
+tick_resolution_us = tick_resolution_ps / 1e6
+ticks_per_bin = int(round(bin_duration_us / tick_resolution_us))
+if ticks_per_bin < 1:
+    ticks_per_bin = 1
+
+# ==================================
+# Global accumulators
+# ==================================
+hist_A = Counter()
+hist_B = Counter()
+
+sum_A = sum_A2 = bins_A = 0
+sum_B = sum_B2 = bins_B = 0
+sum_AB = 0
+
+# ==================================
+# Chunked reading
+# ==================================
+print("Processing file in chunks...\n")
+
+chunk_iter = pd.read_csv(
+    input_file,
+    header=None,
+    names=["timestamp", "channel"],
+    chunksize=chunk_size
+)
+
+for i, chunk in enumerate(chunk_iter, start=1):
+    print(f"Chunk {i}")
+
+    ts = chunk["timestamp"].to_numpy(dtype=np.int64)
+    ch = chunk["channel"].to_numpy(dtype=np.int8)
+
+    H = ts[ch == channel_herald]
+    A = ts[ch == channel_A]
+    B = ts[ch == channel_B]
+
+    if len(H) == 0:
+        continue
+
+    # -------------------------------
+    # Heralded gating (local)
+    # -------------------------------
+    heralded_A, heralded_B = [], []
+
+    for tH in H:
+        heralded_A.extend(A[(A >= tH) & (A <= tH + window_ticks)])
+        heralded_B.extend(B[(B >= tH) & (B <= tH + window_ticks)])
+
+    if not heralded_A and not heralded_B:
+        continue
+
+    heralded_A = np.array(heralded_A, dtype=np.int64)
+    heralded_B = np.array(heralded_B, dtype=np.int64)
+
+    # -------------------------------
+    # SAFE RELATIVE BINNING
+    # -------------------------------
+    t0 = min(
+        heralded_A.min() if len(heralded_A) else np.inf,
+        heralded_B.min() if len(heralded_B) else np.inf
+    )
+
+    bins_end = max(
+        heralded_A.max() if len(heralded_A) else -np.inf,
+        heralded_B.max() if len(heralded_B) else -np.inf
+    )
+
+    n_bins = int((bins_end - t0) / ticks_per_bin) + 1
+    edges = np.arange(0, (n_bins + 1) * ticks_per_bin, ticks_per_bin)
+
+    nA = np.histogram(heralded_A - t0, bins=edges)[0]
+    nB = np.histogram(heralded_B - t0, bins=edges)[0]
+
+    # -------------------------------
+    # Update accumulators
+    # -------------------------------
+    bins_A += len(nA)
+    bins_B += len(nB)
+
+    sum_A += nA.sum()
+    sum_A2 += np.square(nA).sum()
+    sum_B += nB.sum()
+    sum_B2 += np.square(nB).sum()
+
+    sum_AB += np.sum(nA * nB)
+
+    for n, c in zip(*np.unique(nA, return_counts=True)):
+        hist_A[int(n)] += int(c)
+
+    for n, c in zip(*np.unique(nB, return_counts=True)):
+        hist_B[int(n)] += int(c)
+
+# ==================================
+# FINAL STATISTICS
+# ==================================
+mean_A = sum_A / bins_A
+mean_B = sum_B / bins_B
+
+var_A = (sum_A2 - bins_A * mean_A**2) / (bins_A - 1)
+var_B = (sum_B2 - bins_B * mean_B**2) / (bins_B - 1)
+
+std_A = math.sqrt(var_A)
+std_B = math.sqrt(var_B)
+
+err_mA = std_A / math.sqrt(bins_A)
+err_mB = std_B / math.sqrt(bins_B)
+
+err_vA = var_A * math.sqrt(2 / (bins_A - 1))
+err_vB = var_B * math.sqrt(2 / (bins_B - 1))
+
+z_A = (var_A - mean_A) / math.sqrt(err_mA**2 + err_vA**2)
+z_B = (var_B - mean_B) / math.sqrt(err_mB**2 + err_vB**2)
+
+g2_0 = sum_AB / (sum_A * sum_B / bins_A)
+
+# ==================================
+# FINAL DISTRIBUTION & PLOT (A)
+# ==================================
+n_vals = np.array(sorted(hist_A.keys()))
+prob_A = np.array([hist_A[n] for n in n_vals])
+prob_A = prob_A / prob_A.sum()
+
+plt.figure(figsize=(9, 6))
+plt.bar(n_vals, prob_A, alpha=0.7, label="Measured $P_A(n)$")
+plt.plot(n_vals, poisson.pmf(n_vals, mean_A), "o-", color="red", lw=2.5, label="Poisson fit")
+
+plt.text(
+    0.97, 0.97,
+    f"$\\langle n_A \\rangle$ = {format_with_uncertainty(mean_A, err_mA)}\n"
+    f"Var$(n_A)$ = {format_with_uncertainty(var_A, err_vA)}\n"
+    f"$\\sigma$ = {std_A:.4f}\n"
+    f"Z = {z_A:+.2f} σ ({significance_interpretation(z_A)})\n"
+    f"$g^{{(2)}}(0)$ = {g2_0:.3f}",
+    transform=plt.gca().transAxes,
+    ha="right", va="top",
+    bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="black")
+)
+
+plt.xlabel("Photon number n")
+plt.ylabel("Probability $P(n)$")
+plt.title("Heralded Photon-number Distribution (Signal A)")
+plt.grid(axis="y", linestyle=":")
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(out_dir, "heralded_A_FINAL.png"), dpi=300)
+plt.show()
+
+print("\nProcessing complete.")

@@ -1,0 +1,111 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import poisson
+
+# ==========================================
+# User Settings
+# ==========================================
+input_file = "30s-pump=15mW_heralded_sc=2L-sc=50k_80k-Bpf.txt"
+channel_herald = 3   # Herald detector channel
+channel_A = 1        # Signal arm A
+channel_B = 2        # Signal arm B
+max_rows = None
+
+# Time resolution and coincidence settings
+tick_resolution_ps = 81
+coincidence_window_ns = 10    # coincidence window in ns for heralding
+bin_duration_us = 1000        # integration bin for photon counting
+out_prefix = "heralded_stats"
+
+# ==========================================
+# Load data
+# ==========================================
+print("Loading data...")
+df = pd.read_csv(input_file, nrows=max_rows, header=None, names=["timestamp", "channel"])
+timestamps = df["timestamp"].values
+channels = df["channel"].values
+
+times_H = timestamps[channels == channel_herald]
+times_A = timestamps[channels == channel_A]
+times_B = timestamps[channels == channel_B]
+
+print(f"Loaded {len(times_H)} herald, {len(times_A)} signal A, {len(times_B)} signal B events.")
+
+if len(times_H) == 0:
+    raise RuntimeError("No herald events found!")
+
+# ==========================================
+# Heralded gating of events
+# ==========================================
+tick_per_ns = 1000 / tick_resolution_ps  # ticks per ns
+window_ticks = int(coincidence_window_ns * tick_per_ns)
+
+heralded_A, heralded_B = [], []
+
+for tH in times_H:
+    # Events within coincidence window after herald
+    heralded_A.extend(times_A[(times_A >= tH) & (times_A <= tH + window_ticks)])
+    heralded_B.extend(times_B[(times_B >= tH) & (times_B <= tH + window_ticks)])
+
+heralded_A = np.array(heralded_A)
+heralded_B = np.array(heralded_B)
+print(f"Heralded Signal A events: {len(heralded_A)}, Heralded Signal B events: {len(heralded_B)}")
+
+# ==========================================
+# Define analysis time bins for heralded events
+# ==========================================
+tick_resolution_us = tick_resolution_ps / 1e6
+bin_duration_ticks = int(round(bin_duration_us / tick_resolution_us))
+start_time = min(times_H.min(), times_A.min(), times_B.min())
+end_time = max(times_H.max(), times_A.max(), times_B.max())
+num_bins = int((end_time - start_time) / bin_duration_ticks)
+
+bin_edges = np.arange(start_time, end_time + 1, bin_duration_ticks)
+
+# ==========================================
+# Count photons in each bin (heralded)
+# ==========================================
+nA = np.histogram(heralded_A, bins=bin_edges)[0]
+nB = np.histogram(heralded_B, bins=bin_edges)[0]
+
+# Compute heralded photon-number statistics
+mean_nA = np.mean(nA)
+mean_nB = np.mean(nB)
+var_nA = np.var(nA, ddof=1)
+var_nB = np.var(nB, ddof=1)
+
+Q_A = (var_nA - mean_nA) / mean_nA
+Q_B = (var_nB - mean_nB) / mean_nB
+F_A = var_nA / mean_nA
+F_B = var_nB / mean_nB
+
+# Heralded g2(0)
+# g2(0) = <nA * nB> / (<nA> <nB>)
+g2_0 = np.mean(nA * nB) / (mean_nA * mean_nB)
+
+print("\n--- Heralded Photon Statistics ---")
+print(f"<nA>: {mean_nA:.3f}, Var(nA): {var_nA:.3f}, Q_A: {Q_A:.4f}, F_A: {F_A:.4f}")
+print(f"<nB>: {mean_nB:.3f}, Var(nB): {var_nB:.3f}, Q_B: {Q_B:.4f}, F_B: {F_B:.4f}")
+print(f"Heralded g²(0): {g2_0:.4f}")
+
+# ==========================================
+# Plot distribution and Poisson reference
+# ==========================================
+unique_nA, countA = np.unique(nA, return_counts=True)
+unique_nB, countB = np.unique(nB, return_counts=True)
+probA = countA / len(nA)
+probB = countB / len(nB)
+poissA = poisson.pmf(unique_nA, mu=mean_nA)
+poissB = poisson.pmf(unique_nB, mu=mean_nB)
+
+plt.figure(figsize=(9,6))
+plt.bar(unique_nA, probA, width=0.9, color='lightblue', edgecolor='navy', alpha=0.7, label='Heralded $P_A(n)$')
+plt.plot(unique_nA, poissA, 'r--', label=f'Poisson ($\\langle n_A \\rangle={mean_nA:.2f}$)')
+plt.xlabel('Counts per bin (A)')
+plt.ylabel('Probability $P(n)$')
+plt.legend()
+plt.title(f'Heralded Photon-Number Distribution (A)\n$Q_A={Q_A:.3f}$, $F_A={F_A:.3f}$')
+plt.tight_layout()
+plt.savefig(f"{out_prefix}_A_distribution.png", dpi=300)
+plt.show()
